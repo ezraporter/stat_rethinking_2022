@@ -1,0 +1,208 @@
+---
+title: "HW 5"
+format: html
+---
+
+```{r}
+library(rethinking)
+library(tidyverse)
+library(dagitty)
+library(ggdist)
+
+theme_set(theme_minimal())
+data(NWOGrants)
+```
+
+```{r}
+skimr::skim(NWOGrants)
+```
+A simple causal model. Gender (`G`) potentially affects award rate (`A`) directly as well as indirectly through discipline (`D`).
+
+```{r}
+g <- dagitty("dag{ 
+  G -> A ;
+  G -> D ;
+  D -> A
+ }")
+
+plot(g)
+```
+
+To assess the total causal effect of gender I'll fit the model:
+
+$$
+award_i \sim Binomial(application_i, p_i) \\
+
+logit(p_i) = \alpha_{gender[i]} \\
+
+\alpha_j \sim N(?, ?)
+$$
+Picking a value for the prior mean and standard deviation.
+
+I know very little about grant competitiveness in the Netherlands so the prior should cover a wide range of $p$'s. It would be surprising if a majority or more of grants were accepted on average so I'll also explore priors centered in the 0 to .5 range of $p$.
+
+```{r}
+n <- 10000
+
+mu <- c(-1, -.5, 0)
+sigma <- c(1, 1.5, 2)
+
+prior <- expand_grid(mu = mu, sigma = sigma) |>
+  mutate(p = map2(mu, sigma, \(mu, sigma) inv_logit(rnorm(n, mu, sigma)))) |>
+  unnest(p)
+
+prior |>
+  ggplot(aes(x = p, color = factor(mu))) +
+  geom_density() +
+  facet_wrap(~ sigma, labeller = "label_both")
+```
+
+$N(-.5, 1.5)$ looks about right. The prior is skewed towards low $p$'s but has wide coverage.
+
+Fitting the model
+
+```{r}
+m1_data <- NWOGrants |>
+  mutate(gender = if_else(gender == "m", 1, 2)) |>
+  select(gender, awards, applications)
+
+m1_fit <- ulam(
+  alist(awards ~ dbinom(applications, p),
+        logit(p) <- a[gender],
+        a[gender] ~ dnorm(-.5, 1.5)),
+  data = m1_data, chains = 4
+)
+
+precis(m1_fit, depth = 2)
+```
+
+```{r}
+traceplot(m1_fit, window = c(10, 1000))
+```
+
+
+Plotting the posterior
+
+```{r}
+post <- extract.samples(m1_fit)
+p <- inv_logit(post$a) |>
+  as_tibble()
+
+colnames(p) <- paste0("p_", c("M", "F"))
+
+p |>
+  mutate(`p_M - p_F` = p_M - p_F) |>
+  pivot_longer(everything()) |>
+  ggplot(aes(x = value, y = name)) +
+  stat_pointinterval() +
+  labs(x = NULL, y = NULL)
+```
+
+Male applicants have an award rate 2 to 3 percentage points higher than female applications.
+
+Now computing the direct effect by adjusting for discipline, allowing separate gender-discipline effects. The model is:
+
+$$
+award_i \sim Binomial(application_i, p_i) \\
+
+logit(p_i) = \alpha_{gender[i], discipline[i]} \\
+
+\alpha_j \sim N(-.5, 1.5) \\
+
+$$
+
+where I've reused the same prior.
+
+Fitting the model
+
+```{r}
+m2_data <- NWOGrants |>
+  mutate(gender = if_else(gender == "m", 1, 2),
+         discipline = as.integer(discipline)) |>
+  select(gender, discipline, awards, applications)
+
+m2_fit <- ulam(
+  alist(awards ~ dbinom(applications, p),
+        logit(p) <- a[gender, discipline],
+        matrix[gender, discipline]:a ~ dnorm(-.5, 1.5)),
+  data = m2_data, chains = 4
+)
+
+precis(m2_fit, depth = 3)
+```
+
+```{r}
+post <- extract.samples(m2_fit)
+dimnames(post$a) <- list(NULL, c("M", "F"), levels(NWOGrants$discipline))
+
+as_tibble(inv_logit(post$a)) |>
+  pivot_longer(everything()) |>
+  extract(name, c("gender", "discipline"), "(.+)\\.(.+)") |>
+  ggplot(aes(x = value, y = gender,)) +
+  stat_pointinterval() +
+  facet_wrap(~discipline) +
+  labs(x = NULL, y = NULL)
+```
+
+Calculating the gender gap marginalizing over discipline
+
+```{r}
+new_data <- m2_data |>
+  count(discipline, wt = applications, name = "applications") |>
+  uncount(applications)
+
+sim_m2 <- function(gender) {
+  data <- new_data |>
+    mutate(applications = 1, gender = gender)
+  
+  link(m2_fit, data = data)
+}
+
+sim_M <- sim_m2(1)
+sim_F <- sim_m2(2)
+
+tibble(x = as.vector(sim_M - sim_F)) |>
+  ggplot(aes(x = x)) +
+  stat_slabinterval()
+```
+
+```{r}
+data("UFClefties")
+```
+
+```{r}
+with(
+  UFClefties,
+  all(sort(union(fighter1, fighter2)) == 1:max(c(fighter1, fighter2)))
+)
+
+m3_data <- UFClefties |>
+  select(fighter1.win, fighter1.lefty, fighter2.lefty, fighter1, fighter2) |>
+  rename_all(~str_replace(., "\\.", "_")) |>
+  as.list() |>
+  c(list(fighter = 1:244))
+
+m3_fit <- ulam(
+  alist(fighter1_win ~ dbinom(1, p),
+        logit(p) <- a[fighter1] + b*fighter1_lefty - a[fighter2] - b*fighter2_lefty,
+        a[fighter] ~ dnorm(0, 1.5),
+        b ~ dnorm(0, 1.5)),
+  data = m3_data, chains = 4
+)
+
+precis(m3_fit, depth = 2)
+```
+
+```{r}
+post <- extract.samples(m3_fit)
+
+as_tibble(post$a) |>
+  pivot_longer(everything()) |>
+  ggplot(aes(x = value, y = name)) +
+  stat_pointinterval()
+```
+
+```{r}
+dens(post$b)
+```
+
