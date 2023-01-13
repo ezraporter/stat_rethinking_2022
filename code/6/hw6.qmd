@@ -1,0 +1,332 @@
+---
+title: "HW 5"
+format: html
+---
+
+```{r}
+library(rethinking)
+library(tidyverse)
+
+theme_set(theme_minimal())
+```
+
+Simulating the prior predictive distribution of tank survival probabilities from the model:
+
+$$
+logit(p_i) = \alpha_{tank[i]} \\
+\alpha_j \sim N(\bar \alpha, \sigma_a) \\
+\bar \alpha \sim N(0, 1) \\
+\sigma_a \sim Exp(\cdot)
+$$
+
+```{r}
+sim_alpha <- function(sigma_prior, n_sim = 100000) {
+  tibble(
+    alpha_bar = rnorm(n_sim),
+    sigma = rexp(n_sim, sigma_prior),
+    x = inv_logit(rnorm(n_sim, alpha_bar, sigma))
+  )
+}
+
+sigma_priors <- c(.1, 1, 10)
+
+sims <- tibble(sigma_prior = sigma_priors, data = map(sigma_priors, sim_alpha)) |>
+  unnest(data)
+
+sims |>
+  ggplot(aes(x = x, color = factor(sigma_prior))) +
+  geom_density() +
+  labs(color = latex2exp::TeX("$\\sigma_{\\alpha} \\sim Exp(\\cdot)$"),
+       y = NULL,
+       x = "p")
+
+```
+
+Loading the reedfrog data
+
+```{r}
+data("reedfrogs")
+```
+
+We want to model tank survival probabilities as a function tank, `size` (the size of the tadpoles: big or small), `pred` (presence or absence of predators). The intercept model in Ch 13 uses partial pooling across tanks. I added `pred`-`size` intercepts:
+
+$$
+surv_i \sim Binomial(density_i, p_i) \\
+logit(p_i) = \alpha_{tank[i]} + \beta_{pred[i], size[i]} \\
+\alpha_j \sim N(\bar \alpha, \sigma_{\alpha}) \\
+\bar \alpha \sim N(0, 1.5) \\
+\sigma_{\alpha} \sim Exp(1) \\
+\beta_{k,l} \sim N(0, ?)
+$$
+
+First sampling from the prior of the tank-intercept-only model
+
+```{r}
+m1_data <- reedfrogs |>
+  mutate(tank = 1:n(),
+         size = as.integer(size),
+         pred = as.integer(pred))
+
+m1_prior_a_only <- ulam(
+  alist(
+    surv ~ dbinom(density, p),
+    logit(p) <- a[tank],
+    a[tank] ~ dnorm(abar, sigma_a),
+    abar ~ dnorm(0, 1.5),
+    sigma_a ~ dexp(1)
+  ),
+  chains = 4, data = m1_data, sample_prior = TRUE
+)
+```
+
+```{r}
+plot_prior <- function(prior) {
+  prior_link <- link(prior)
+  
+  p1 <- as.vector(extract.samples(prior)$a) |>
+    as_tibble() |>
+    ggplot(aes(x = value)) +
+    geom_density() +
+    labs(x = expression(alpha))
+  
+  p2 <- as.vector(prior_link) |>
+    as_tibble() |>
+    ggplot(aes(x = value)) +
+    geom_density() +
+    labs(x = "p")
+  
+  list(p1, p2)
+}
+
+plot_prior(m1_prior_a_only)
+```
+
+This doesn't look quite right and there were some warnings so trying the non-centered parameterization
+
+```{r}
+m1_prior_a_only_nc <- ulam(
+  alist(
+    surv ~ dbinom(density, p),
+    logit(p) <- abar + z_a[tank]*sigma_a,
+    # priors
+    z_a[tank] ~ dnorm(0, 1),
+    abar ~ dnorm(0, 1.5),
+    sigma_a ~ dexp(1),
+    # generated quantities
+    gq> vector[tank]:a <<- abar + z_a*sigma_a
+  ),
+  chains = 4, data = m1_data, sample_prior = TRUE
+)
+
+plot_prior(m1_prior_a_only_nc)
+```
+
+This looks better but the survival probs are slightly over-bunched near 0 and 1. I'll fix this after adding in the `size`-`pred` effects.
+
+```{r}
+m1_prior <- ulam(
+  alist(
+    surv ~ dbinom(density, p),
+    logit(p) <- z_a[tank]*sigma_a + b[size, pred],
+    # priors
+    z_a[tank] ~ dnorm(0, 1),
+    sigma_a ~ dexp(.75),
+    matrix[size, pred]:b ~ dnorm(0, 1),
+    # generated quantities
+    gq> vector[tank]:a <<- z_a*sigma_a
+  ),
+  chains = 4, data = m1_data, sample_prior = TRUE
+)
+
+plots <- plot_prior(m1_prior)
+
+plots[[1]] + coord_cartesian(xlim = c(-3,3))
+
+plots[[2]]
+
+# Odds ratio for pred-size effect
+
+samples <- extract.samples(m1_prior)
+
+samples$b[,,1] |>
+  as_tibble() |>
+  transmute(odds_ratio = exp(V1-V2)) |>
+  ggplot(aes(x = odds_ratio)) +
+  geom_density() +
+  coord_cartesian(xlim = c(0,10)) +
+  geom_vline(aes(xintercept = 1))
+
+```
+
+```{r}
+m1_fit <- ulam(
+  alist(
+    surv ~ dbinom(density, p),
+    logit(p) <- z_a[tank]*sigma_a + b[size, pred],
+    # priors
+    z_a[tank] ~ dnorm(0, 1),
+    sigma_a ~ dexp(.75),
+    matrix[size, pred]:b ~ dnorm(0, 1),
+    # generated quantities
+    gq> vector[tank]:a <<- z_a*sigma_a
+  ),
+  chains = 4, data = m1_data
+)
+```
+
+```{r}
+precis(m1_fit, depth = 3, pars = c("b", "sigma_a"))
+```
+
+Plotting the counterfactual distribution of tank survival under manipulation of `size` and `pred`
+
+```{r}
+m1_sim <- function(size, pred) {
+  dat <- m1_data
+  dat$size <- size
+  dat$pred <- pred
+  
+  link(m1_fit, dat) |>
+    as_tibble()
+}
+
+sim_res <- expand_grid(size = 1:2, pred = 1:2)
+
+sim_res$data <- pmap(sim_res, m1_sim)
+
+size_labs <- c("big", "small")
+pred_labs <- c("no", "yes")
+
+sim_res|>
+  mutate(size = size_labs[size], pred = pred_labs[pred]) |>
+  unnest(data) |>
+  pivot_longer(-c(size, pred)) |>
+  ggplot(aes(y = paste(size, pred, sep = "/"), x = value)) +
+  ggdist::stat_halfeye() +
+  labs(y = "size/pred", x = "p")
+```
+
+Predation has a large negative effect on survival. In tanks with predation, larger tadpoles have a slightly lower survival rate than smaller tadpoles. In tanks without predation, size has no effect on survival. This may be a ceiling effect. Survival rates in the big tadpole group may be high enough that the small tadpoles have nowhere for survival to increase.
+
+```{r}
+m2_data <- m1_data |>
+  mutate(density_cat = case_when(
+    density == 10 ~ 1,
+    density == 25 ~ 2,
+    density == 35 ~ 3
+  ))
+
+m2_fit <- ulam(
+  alist(
+    surv ~ dbinom(density, p),
+    logit(p) <- z_a[tank]*sigma_a + b[size, pred] + c[density_cat, pred],
+    # priors
+    z_a[tank] ~ dnorm(0, 1),
+    sigma_a ~ dexp(.75),
+    matrix[size, pred]:b ~ dnorm(0, 1),
+    matrix[density_cat, pred]:c ~ dnorm(0, 1),
+    # generated quantities
+    gq> vector[tank]:a <<- z_a*sigma_a
+  ),
+  chains = 4, data = m2_data
+)
+```
+
+```{r}
+precis(m2_fit, depth = 3, pars = c("c", "sigma_a"))
+```
+
+We now want to estimate the causal effect of predators in a population with the following characteristics:
+
+- 25% `density` = 10, `size` = big
+- 25% `density` = 35, `size` = big
+- 25% `density` = 10, `size` = small
+- 25% `density` = 35, `size` = small
+
+Since we're given a density I'll assume we intend to keep the tank structure but imagine we're observing new tanks from the population. I'll also assume we want the `density`/`size` distribution to apply at the tadpole level.
+
+One way to simulate this is to simulate a number of tanks from each `density`/`size` bucket and fix the ratio of simulated tanks at 7:2, small:big, so that the tadpole totals even out.
+
+Since the question doesn't give an indication of sample size, I'm imagining we want enough tanks to simulate a possibly infinite population. 5*big/small-factor gives 350 tadpoles in each condition or 1400 overall.
+
+```{r}
+n <- 5
+
+sim_plan <- tibble(
+  density = c(10, 35, 10, 35),
+  n_tanks = c(7, 2, 7, 2) * n,
+  size = c(1, 1, 2, 2)
+) |>
+  mutate(n_tadpoles = density*n_tanks)
+```
+
+Run the simulation
+
+```{r}
+post <- extract.samples(m2_fit)
+
+# Explode out to tank-level data
+sim_dat <- sim_plan |>
+  mutate(density_cat = if_else(density == 10, 1, 3)) |>
+  uncount(n_tanks) |>
+  mutate(tank = row_number())
+
+sim_poststrat <- function(sim_dat, pred) {
+  
+  # Make sure we draw the same tank effects on each sim
+  set.seed(0)
+  
+  # Use these to get the dims right below
+  n_post <- length(post$sigma_a)
+  n_tanks <- nrow(sim_dat)
+  
+  # a, b, c will all be n_post by n_tanks matricies
+  # 1 element per tank per posterior draw
+  
+  # draw tank effect from N(0, sigma_a)
+  a <- rnorm(n_post*n_tanks, sd = post$sigma_a) |> matrix(n_post, n_tanks)
+
+  # select correct size-pred and density-pred effects for each tank
+  b <- post$b[,,pred][,sim_dat$size]
+  c <- post$c[,,pred][,sim_dat$density_cat]
+
+  # compute survival prob
+  res <- inv_logit(a + b + c)
+  colnames(res) <- sim_dat$tank
+  
+  res |>
+    as_tibble() |>
+    mutate(draw = row_number()) |>
+    pivot_longer(-draw, names_to = "tank", values_to = paste0("p_", pred)) |>
+    mutate(tank = as.integer(tank))
+}
+
+sim_no_pred <- sim_poststrat(sim_dat, 1)
+sim_pred <- sim_poststrat(sim_dat, 2)
+
+sim_res <- sim_dat |>
+  left_join(sim_no_pred) |>
+  left_join(sim_pred) |>
+  mutate(diff = p_1 - p_2)
+```
+
+Tank-level increase in survival rate associated with removing predators
+
+```{r}
+sim_res |>
+  ggplot(aes(x = diff)) +
+  ggdist::stat_halfeye()
+```
+
+Tadpole-level increase in survival rate associated with removing predators
+
+```{r}
+sim_res |>
+  uncount(density) |>
+  ggplot(aes(x = diff)) +
+  ggdist::stat_halfeye()
+```
+
+The difference in the tank and tadpole-level estimates are due to the fact that low density tanks were over-represented in the post-stratification. This was by design to balance the numbers of *tadpoles* in low vs. high density tanks.
+
+The model predicts presence of predators to have a smaller effect in low density tanks so the first, tank-level, graph skews towards smaller effects.
