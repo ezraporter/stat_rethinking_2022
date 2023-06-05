@@ -1,0 +1,356 @@
+---
+title: "Week 7"
+format: html
+---
+
+```{r}
+library(rethinking)
+library(tidyverse)
+library(ggdist)
+
+data("bangladesh")
+
+theme_set(theme_minimal())
+```
+
+```{r}
+m1_data <- list(
+  district = bangladesh$district,
+  contraception = bangladesh$use.contraception,
+  n_districts = max(bangladesh$district)
+)
+
+m1_fit <- ulam(
+  alist(
+    contraception ~ dbinom(1, p),
+    logit(p) <- a[district],
+    vector[n_districts]:a ~ dnorm(abar, sigma_a),
+    abar ~ dnorm(0, 1),
+    sigma_a ~ dexp(1)
+  ),
+  data = m1_data, chains = 4, cores = 4
+)
+```
+
+Simulating from the prior
+
+```{r}
+theme_set(theme_minimal())
+
+prior <- extract.prior(m1_fit)
+
+prior[c("abar", "sigma_a")] |>
+  as_tibble() |>
+  slice_sample(n = 100) |>
+  mutate(dist = distributional::dist_normal(abar, sigma_a)) |>
+  ggplot() +
+  ggdist::stat_slab(aes(xdist = dist), fill = NA, color = "black", alpha = .5, size = .5) +
+  coord_cartesian(xlim = c(-5, 5))
+
+rnorm(10000, prior$abar, prior$sigma_a) |>
+  inv_logit() |>
+  as_tibble() |>
+  ggplot(aes(x = value)) +
+  ggdist::stat_halfeye()
+```
+
+Partial pooling vs. no pooling estimates of the contraception rate in each district ordered by the number of observations sampled
+
+```{r}
+m1_no_pooling <- bangladesh |>
+  group_by(district) |>
+  summarize(mean = mean(use.contraception),
+            N = n()) |>
+  complete(district = 1:61, fill = list(N = 0))
+
+posterior <- extract.samples(m1_fit)
+
+m1_results$`Partial Pooling` <- inv_logit(colMeans(posterior$a))
+
+m1_partial_pooling <- posterior$a |>
+  inv_logit() |>
+  as_tibble() |>
+  pivot_longer(
+    everything(),
+    names_to = "district",
+    names_transform = ~as.integer(gsub("V", "", .)),
+    values_to = "est"
+  ) |>
+  left_join(select(m1_no_pooling, district, N), by = "district")
+  
+    
+m1_partial_pooling |>
+  ggplot(aes(x = N)) +
+  ggdist::stat_pointinterval(aes(y = est)) +
+  geom_point(data = m1_no_pooling, aes(y = mean), color = "red")
+
+```
+
+Shrinkage is larger for undersampled clusters. District 54, which had no observations in the data, has a posterior mean equal to the poster mean for $\bar \alpha$.
+
+This DAG represents the causal relationships between contraceptive use (C), district (D), urbanity of district (U), number of kids (K), and age (A). We're interested in the effect of U on C.
+
+```{r}
+library(dagitty)
+
+dag <- dagitty("dag{
+  U <- D -> C;
+  U -> C;
+  K <- A -> D;
+  A -> C;
+  C <- K -> D;
+}")
+
+plot(dag)
+```
+
+All variables have direct causal paths to C: age and number of children impact likelihood of contraceptive use. D captures neighborhood effects on contraceptive use, some of which may be explained by the urbanity of the neighborhood.
+
+A and K have paths to D due to sorting into neighborhoods based on age and family composition.
+
+A has a path to K since, at the very least, older individuals have had more of an opportunity to have children.
+
+In this causal model the direct and total effect of U on C are the same and conditioning on allows me to estimate the U -> C path. 
+
+```{r}
+adjustmentSets(dag, exposure = "U", outcome = "C")
+```
+
+This is actually a pretty boring DAG for the problem so I'll adopt the DAG proposed by McElreath in his solutions:
+
+```{r}
+dag_v2 <- dagitty("dag{
+  U <- D -> C;
+  K <- U -> C;
+  K -> C;
+  K <- A -> C;
+}")
+
+plot(dag_v2)
+```
+
+The main difference is that my DAG emphasizes sorting into neighborhoods so potential demographic confounders are effectively controlled for by conditioning on district. McElreath's DAG emphasizes the effect that neighborhood characteristics could have on choices to have children and treats district as exogenous.
+
+Now to estimate the total effect includes the U -> K -> C path.
+
+D is a classic confound so we need to condition on it for both the direct and total effects.
+
+For the total effect conditioning on D is sufficient because it is the only backdoor path from U. The path through K is part of the total effect.
+
+For the direct effect we need to condition on K. Doing so opens a backdoor path through A so we must condition on that as well.
+
+The total effect model is:
+
+$$
+contraception_i \sim Bern(p_i) \\
+logit(p_i) = \alpha_{district[i]} + \beta_{urban}urban_i \\
+\alpha_{district} \sim N(\bar \alpha, \sigma_{\alpha}) \\
+\bar \alpha \sim N(0, 1) \\
+\sigma_{\alpha} \sim Exp(1) \\
+\beta_{urban} \sim N(0, \sigma_{urban})
+$$
+
+Let's consider a range of values for $\sigma_{urban}$ in a prior simulation with 1000 individuals from 10 districts.
+
+`diff` here is the effect (counterfactual difference) of urbanicity on the probability of using contraception. The first plot show the distribution of individual effects. The second plot shows the prior distribution of average treatment effect.
+
+```{r}
+
+sim_total_prior <- function(sigma_b_u, n_sample = 1000) {
+  .sim_prior <- function(sample, sigma_b_u) {
+    n_district <- 10
+    n_obs <- 1000
+    
+    abar <- rnorm(1, 0, 1)
+    sigma_a <- rexp(1, 1)
+    
+    district <- sample(1:n_district, n_obs, replace = TRUE)
+    
+    a <- rnorm(n_district, abar, sigma_a)
+    
+    beta_u <- rnorm(1, 0, sigma_b_u)
+    
+    p0 <- inv_logit(a[district])
+    
+    p1 <- inv_logit(a[district] + beta_u)
+    
+    tibble(sample = sample, p0 = p0, diff = p1 - p0)
+  }
+  
+  map(1:n_sample, \(x) .sim_prior(x, sigma_b_u)) |>
+    bind_rows()
+}
+
+sim_results <- tibble(sigma_b_u = c(.5, .75, 1, 2, 5, 10))
+
+sim_results <- sim_results |>
+  mutate(sim = map(sigma_b_u, sim_total_prior)) |>
+  unnest(sim)
+
+sim_results |>
+  ggplot(aes(x = diff)) +
+  geom_density() +
+  facet_wrap(~sigma_b_u)
+
+sim_results |>
+  summarize(across(c(p0, diff), mean), .by = c(sample, sigma_b_u)) |>
+  ggplot(aes(x = p0, y = diff)) +
+  geom_point(alpha = .25) +
+  facet_wrap(~sigma_b_u)
+```
+
+Note that the fact that the ATE is a difference of probabilities imposes particular constraints. $\sigma_{urban} = 2$ roughly fills the space of mathematically possible ATEs. Larger $\sigma_{urban}$s result in a pile-up on the boundary, implying a high probability that the difference in contraception rates is as large as possible in absolute terms. $\sigma_{urban} = 1$ is a reasonable prior.
+
+```{r}
+m2_data <- list(
+  district = bangladesh$district,
+  contraception = bangladesh$use.contraception,
+  n_districts = max(bangladesh$district),
+  urban = bangladesh$urban,
+  age = bangladesh$age.centered,
+  kids = bangladesh$living.children
+)
+
+m2_total_mod <- alist(
+    contraception ~ dbinom(1, p),
+    logit(p) <- a[district] + beta_u*urban,
+    vector[n_districts]:a ~ dnorm(abar, sigma_a),
+    beta_u ~ dnorm(0, 1),
+    abar ~ dnorm(0, 1),
+    sigma_a ~ dexp(1)
+  )
+
+m2_total_fit <- ulam(m2_total_mod, data = m2_data, chains = 4, cores = 4)
+```
+
+```{r}
+precis(m2_total_fit)
+```
+
+The posterior indicates that urban living increases contraception rates by 10 to 20 percentage points when considering all causal paths.
+
+```{r}
+m2_data_0 <- m2_data_1 <- m2_data
+
+m2_data_0$urban <- rep(0, nrow(bangladesh))
+m2_data_1$urban <- rep(1, nrow(bangladesh))
+
+m2_total_post <- link(m2_total_fit, data = m2_data_1) - link(m2_total_fit, data = m2_data_0)
+
+m2_total_post <- tibble(
+  diff = as.vector(m2_total_post),
+  sample = rep(1:2000, nrow(bangladesh)),
+  district = rep(bangladesh$district, each = 2000)
+)
+
+m2_total_post |>
+  ggplot(aes(x = diff)) +
+  stat_halfeye()
+
+m2_total_post |>
+  ggplot(aes(x = diff, y = factor(district))) +
+  stat_pointinterval()
+```
+
+There is some effect heterogeneity by district but this may be an artifact of the model since we didn't allow $\beta_{urban}$ to vary by district. The logit link function makes the effect of urban multiplicative so, with a constant multiplicative effect, the difference in contraception rate will be smallest for districts with smaller $\alpha$s. For example, district 11 had an observed contraception rate of 0.
+
+```{r}
+bangladesh |>
+  summarize(contraception = mean(use.contraception), .by = district) |>
+  arrange(contraception)
+```
+
+Now for the direct effect. The model is:
+
+$$
+contraception_i \sim Bern(p_i) \\
+logit(p_i) = \alpha_{district[i]} + \beta_{urban}urban_i + \beta_{age}age_i + \gamma_{kids[i]} \\
+\alpha_{district} \sim N(\bar \alpha, \sigma_{\alpha}) \\
+\bar \alpha \sim N(0, 1) \\
+\sigma_{\alpha} \sim Exp(1) \\
+\beta_{urban} \sim N(0, \sigma_{1}) \\
+\beta_{age} \sim N(0, \sigma_{2}) \\
+\gamma_{kids} \sim N(0, \sigma_{2})
+$$
+
+where we'll select values for $\sigma_1$ and $\sigma_2$ through prior simulation.
+
+$\sigma_1 = \sigma_2 = 2$ covers a plausible range for the ATE. It turns out that the prior values here don't have a significant effect on the results.
+
+```{r}
+sim_direct_prior <- function(sigma_1, sigma_2, data, n_sample = 1000) {
+  .sim_prior <- function(sample) {
+    
+    abar <- rnorm(1, 0, 1)
+    sigma_a <- rexp(1, 1)
+    
+    a <- rnorm(data$n_districts, abar, sigma_a)
+    
+    beta_u <- rnorm(1, 0, sigma_1)
+    beta_a <- rnorm(1, 0, sigma_2)
+    gamma <- rnorm(4, 0, sigma_2)
+    
+    lin_pred_0 <- a[data$district] + beta_a*data$age + gamma[data$kids]
+    
+    p0 <- inv_logit(lin_pred_0)
+    
+    p1 <- inv_logit(lin_pred_0 + beta_u)
+    
+    tibble(sample = sample, p0 = p0, diff = p1 - p0)
+  }
+  
+  map(1:n_sample, .sim_prior) |>
+    bind_rows()
+}
+
+sim_results <- expand_grid(
+  sigma_1 = c(.5, .75, 1, 2),
+  sigma_2 = c(.5, .75, 1, 2)
+)
+
+sim_results <- sim_results %>%
+  mutate(sim = pmap(.l = ., sim_direct_prior, data = m2_data)) |>
+  unnest(sim)
+
+sim_results |>
+  summarize(across(c(p0, diff), mean), .by = c(sample, sigma_1, sigma_2)) |>
+  ggplot(aes(x = diff, y = paste(sigma_1, sigma_2, sep = ", "))) +
+  stat_pointinterval() +
+  labs(y = "sigma_1, sigma_2")
+```
+
+The estimated direct effect of urban living is essentially the same as the total effect. That is, the pathway through age and number of children is not particularly important. 
+
+```{r}
+m2_direct_mod <- alist(
+    contraception ~ dbinom(1, p),
+    logit(p) <- a[district] + beta_u*urban + beta_a*age + g[kids],
+    vector[n_districts]:a ~ dnorm(abar, sigma_a),
+    beta_u ~ dnorm(0, 2),
+    abar ~ dnorm(0, 1),
+    sigma_a ~ dexp(1),
+    vector[4]:g ~ dnorm(0, 2),
+    beta_a ~ dnorm(0, 2)
+  )
+
+m2_direct_fit <- ulam(m2_direct_mod, data = m2_data, chains = 4, cores = 4)
+
+precis(m2_direct_fit)
+
+m2_direct_post <- link(m2_direct_fit, data = m2_data_1) - link(m2_direct_fit, data = m2_data_0)
+
+m2_direct_post <- tibble(
+  diff = as.vector(m2_direct_post),
+  sample = rep(1:2000, nrow(bangladesh)),
+  district = rep(bangladesh$district, each = 2000)
+)
+
+m2_direct_post |>
+  ggplot(aes(x = diff)) +
+  stat_halfeye()
+
+m2_direct_post |>
+  ggplot(aes(x = diff, y = factor(district))) +
+  stat_pointinterval()
+```
+
